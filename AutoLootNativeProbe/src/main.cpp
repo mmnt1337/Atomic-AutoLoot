@@ -889,6 +889,28 @@ namespace
             info_param->DestroyValue(info_value);
             return false;
         }
+
+        // G9 / 2026-08-05 UE4SS Box4: residual AttachedItems with empty SavedItemsInShelves
+        // (shelves=0, source_index=-1). OnContainerRemovedItem AV-crashes (null+0xC) looking up
+        // a backing saved row that does not exist. AttachedItems surgery already removed the
+        // live entry — skip the BP callback and leave SavedItems untouched.
+        if (target.attached_only)
+        {
+            info_param->DestroyValue(info_value);
+            bool looted_after{};
+            int32 shelves_after{};
+            if (!read_source_state(target.source, looted_after, shelves_after) ||
+                shelves_after != target.shelves_before)
+            {
+                emit_log(STR("[AutoLootNativeProbe] SOURCE_REMOVE_FAIL reason=attached_only_saved_drift shelves_before={} shelves_after={}\n"),
+                         target.shelves_before, shelves_after);
+                return false;
+            }
+            emit_log(STR("[AutoLootNativeProbe] SOURCE_REMOVE_SKIP_CALLBACK reason=attached_only container={} shelf_index={} attached_after={} shelves={}\n"),
+                     exact_name(target.layout), target.shelf_index, attached.Num(), shelves_after);
+            return true;
+        }
+
         if constexpr (VerboseDiagnostics)
         {
             emit_log(STR("[AutoLootNativeProbe] SOURCE_REMOVE_BEGIN path={} container={} shelf_index={} info_type={} info_size={} item_asset={} amount={}\n"),
@@ -901,22 +923,8 @@ namespace
         // leaves SavedItemsInShelves unchanged while wiping the rest of AttachedItems
         // (FAIL source_removal_invariants shelves_before=N shelves_after=N attached_after=0).
         // Recover the SavedItems row surgically so the item is not stranded.
-        // G9 attached_only: no SavedItemsInShelves row backs the item; the callback must leave
-        // the saved array untouched (shelves_after == shelves_before).
         bool looted_after{};
         int32 shelves_after{};
-        if (target.attached_only)
-        {
-            if (!read_source_state(target.source, looted_after, shelves_after) ||
-                shelves_after != target.shelves_before)
-            {
-                emit_log(STR("[AutoLootNativeProbe] SOURCE_REMOVE_FAIL reason=attached_only_saved_drift shelves_before={} shelves_after={}\n"),
-                         target.shelves_before, shelves_after);
-                return false;
-            }
-            if constexpr (VerboseDiagnostics) emit_log(STR("[AutoLootNativeProbe] SOURCE_REMOVE_END call_count=1 path=attached_only\n"));
-            return true;
-        }
         if (!read_source_state(target.source, looted_after, shelves_after) ||
             shelves_after != target.shelves_before - 1)
         {
@@ -965,13 +973,10 @@ namespace
 
     auto invoke_container_purge(UObject* source, UObject* layout, int32 expected_shelves, bool no_layout) -> bool
     {
-        auto* function = UObjectGlobals::StaticFindObject<UFunction*>(nullptr, nullptr, PurgeContainerPath, false);
-        auto* container_param = require_property<FObjectPropertyBase>(function, STR("OnContainerPurged"), STR("Container"));
-        if (!source || !layout || expected_shelves < 0 || !function || !container_param ||
-            function->GetParmsSize() == 0 || function->GetParmsSize() > 64)
+        if (!source || !layout || expected_shelves < 0)
         {
-            emit_log(STR("[AutoLootNativeProbe] PURGE_FAIL reason=contract function={} container_param={} parms_size={}\n"),
-                     exact_name(function), container_param != nullptr, function ? function->GetParmsSize() : 0);
+            emit_log(STR("[AutoLootNativeProbe] PURGE_FAIL reason=contract source={} layout={} expected_shelves={}\n"),
+                     exact_name(source), exact_name(layout), expected_shelves);
             return false;
         }
 
@@ -982,9 +987,29 @@ namespace
             return false;
         }
 
-        std::vector<uint8> params(function->GetParmsSize(), 0);
-        container_param->SetObjectPropertyValue(container_param->ContainerPtrToValuePtr<void>(params.data()), layout);
-        source->ProcessEvent(function, params.data());
+        // G12: no_layout stand-in is the lootbox itself (layout == source). OnContainerPurged
+        // expects a real layout actor; ProcessEvent with that stand-in AV-crashes the shipping
+        // build (read null+0x8 inside AtomicHeart-Win64-Shipping). Skip the BP callback and
+        // mark bLooted below — same end state the game wants for empty SavedItemsInShelves.
+        if (no_layout)
+        {
+            emit_log(STR("[AutoLootNativeProbe] PURGE_SKIP reason=no_layout_standin source={}\n"), exact_name(source));
+        }
+        else
+        {
+            auto* function = UObjectGlobals::StaticFindObject<UFunction*>(nullptr, nullptr, PurgeContainerPath, false);
+            auto* container_param = require_property<FObjectPropertyBase>(function, STR("OnContainerPurged"), STR("Container"));
+            if (!function || !container_param || function->GetParmsSize() == 0 || function->GetParmsSize() > 64)
+            {
+                emit_log(STR("[AutoLootNativeProbe] PURGE_FAIL reason=contract function={} container_param={} parms_size={}\n"),
+                         exact_name(function), container_param != nullptr, function ? function->GetParmsSize() : 0);
+                return false;
+            }
+
+            std::vector<uint8> params(function->GetParmsSize(), 0);
+            container_param->SetObjectPropertyValue(container_param->ContainerPtrToValuePtr<void>(params.data()), layout);
+            source->ProcessEvent(function, params.data());
+        }
 
         bool looted{};
         int32 shelves{};
@@ -1000,6 +1025,7 @@ namespace
             // itself treats empty arrays as fully looted; set the flag explicitly.
             // G9: only when every owner-bound layout is empty — multi-drawer furniture keeps
             // live items in secondary layouts that bLooted=true would lock out again.
+            // G12: no_layout never called OnContainerPurged; always set bLooted here when empty.
             if (!all_bound_layouts_empty(source, static_cast<AActor*>(source)))
             {
                 emit_log(STR("[AutoLootNativeProbe] PURGE_DEFER_LOOTED source={} layout={} reason=other_bound_layouts_not_empty\n"),
@@ -1012,7 +1038,8 @@ namespace
                 {
                     looted_property->SetPropertyValueInContainer(source, true);
                     looted = true;
-                    emit_log(STR("[AutoLootNativeProbe] PURGE_SET_LOOTED source={} layout={}\n"), exact_name(source), exact_name(layout));
+                    emit_log(STR("[AutoLootNativeProbe] PURGE_SET_LOOTED source={} layout={} no_layout={}\n"),
+                             exact_name(source), exact_name(layout), no_layout);
                 }
                 else
                 {
@@ -1022,8 +1049,8 @@ namespace
         }
         // G9: deferring bLooted while other drawers still hold items is a valid non-terminal state.
         const bool state_ok = base_ok && (final_layout ? looted || !all_bound_layouts_empty(source, static_cast<AActor*>(source)) : !looted);
-        emit_log(STR("[AutoLootNativeProbe] PURGE_CALL result={} source={} layout={} final_layout={} bLooted={} shelves={} attached={}\n"),
-                 state_ok, exact_name(source), exact_name(layout), final_layout, looted, shelves, attached_after);
+        emit_log(STR("[AutoLootNativeProbe] PURGE_CALL result={} source={} layout={} final_layout={} bLooted={} shelves={} attached={} no_layout={}\n"),
+                 state_ok, exact_name(source), exact_name(layout), final_layout, looted, shelves, attached_after, no_layout);
         return state_ok;
     }
 

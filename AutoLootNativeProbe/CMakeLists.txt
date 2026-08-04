@@ -13,6 +13,10 @@ add_library(AutoLootNativeProbe SHARED src/main.cpp)
 target_compile_features(AutoLootNativeProbe PRIVATE cxx_std_23)
 target_link_libraries(AutoLootNativeProbe PUBLIC UE4SS)
 
+add_library(AutoLootNativeTrace SHARED ../AutoLootNativeTrace/src/main.cpp)
+target_compile_features(AutoLootNativeTrace PRIVATE cxx_std_23)
+target_link_libraries(AutoLootNativeTrace PUBLIC UE4SS)
+
 add_executable(AutoLootOrchestrationSelfTest tests/orchestration_selftest.cpp src/orchestration.hpp)
 target_compile_features(AutoLootOrchestrationSelfTest PRIVATE cxx_std_23)
 enable_testing()
@@ -24,4 +28,12 @@ set_target_properties(AutoLootNativeProbe PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>/bin/AutoLootNativeProbe"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>/bin/AutoLootNativeProbe"
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>/lib/AutoLootNativeProbe"
+)
+
+set_target_properties(AutoLootNativeTrace PROPERTIES
+    OUTPUT_NAME "main"
+    PREFIX ""
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>/bin/AutoLootNativeTrace"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>/bin/AutoLootNativeTrace"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>/lib/AutoLootNativeTrace"
 )
