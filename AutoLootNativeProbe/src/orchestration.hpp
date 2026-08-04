@@ -112,6 +112,15 @@ namespace autoloot::post7c3
         {"BP_VovCharacter_Fast_C", "BP_PickupableItemContainer_VovaBlack_C"},
     };
 
+    inline auto layout_class_for_source(std::string_view source_class) noexcept -> std::string_view
+    {
+        for (const auto& profile : LayoutProfiles)
+        {
+            if (profile.source_class == source_class) return profile.layout_class;
+        }
+        return {};
+    }
+
     struct ItemProfile
     {
         std::string_view inventory_data;

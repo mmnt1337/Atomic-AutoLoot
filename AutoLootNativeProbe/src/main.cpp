@@ -32,7 +32,7 @@ namespace
 
     constexpr auto Marker = STR("ALNP_7C_CONTAINER_X1C_20260725_C838A8AC");
     constexpr auto OrchestrationMarker = STR("ALNP_AUTO_X1_20260726_C838A8AC");
-        constexpr auto BuildVariantMarker = STR("ALNP_G8B_MULTI_BOUND_LAYOUT_20260804_C838A8AC");
+        constexpr auto BuildVariantMarker = STR("ALNP_G12_NO_LAYOUT_SAVED_20260805_C838A8AC");
     constexpr bool VerboseDiagnostics = false;
     constexpr int32 IncrementalScanMaxSlots = 2048;
     constexpr int64 IncrementalScanBudgetUs = 750;
@@ -63,6 +63,10 @@ namespace
         int32 attached_before{};
         bool looted_before{};
         bool corpse_surface{};
+        bool attached_only{};
+        // G12: the level holds no layout actor for this source (game spawns it only on manual
+        // open). `layout` points at the source itself as a stand-in; all layout guards skip.
+        bool no_layout{};
     };
 
     struct RuntimeScanView
@@ -84,6 +88,13 @@ namespace
 
     std::vector<StringType> ProcessedFloorPickups;
     std::vector<StringType> ProcessedWorldPickups;
+    // 2026-08-05 UE4SS.log: find_detached_layout(s)_for_source used to walk the FULL
+    // UObjectArray (hundreds of thousands of entries) synchronously on the game thread on
+    // every candidate attempt (up to 4x/tick, plus every all_bound_layouts_empty call). Adjacent
+    // LAYOUT_FALLBACK_SKIP log timestamps showed 30-70ms per call, several per tick -> the
+    // reported stutter. Populate this cache incrementally (budgeted, same pass that already
+    // scans UObjectArray for sources/pickups) and have layout lookups consume it instead.
+    std::vector<FWeakObjectPtr> LayoutObjectCache;
     std::atomic_bool RuntimeLoggingEnabled{true};
 
     template <typename... Arguments>
@@ -307,11 +318,19 @@ namespace
         return nullptr;
     }
 
+    // G12: no-layout SAVED_ONLY targets carry the source as `layout`; classify them by the
+    // expected layout class from LayoutProfiles so admission/allowlist rules stay unchanged.
+    auto target_layout_class_name(const AcquisitionTarget& target) -> std::string_view
+    {
+        if (target.no_layout) return autoloot::post7c3::layout_class_for_source(catalog_source_name(target.source));
+        return catalog_layout_name(target.layout);
+    }
+
     auto catalog_descriptor(const AcquisitionTarget& target) -> autoloot::post7c3::Descriptor
     {
         return {
             std::string{catalog_source_name(target.source)},
-            std::string{catalog_layout_name(target.layout)},
+            std::string{target_layout_class_name(target)},
             std::string{catalog_pickup_name(target.loaded_class)},
             std::string{catalog_item_data_name(target.item_asset)},
             target.amount,
@@ -322,8 +341,8 @@ namespace
     auto runtime_target_supported(const AcquisitionTarget& target) -> bool
     {
         return target.source && target.layout && target.item_asset && target.loaded_class && target.amount > 0 &&
-               !catalog_source_name(target.source).empty() && !catalog_layout_name(target.layout).empty() &&
-               autoloot::post7c3::layout_supported(catalog_source_name(target.source), catalog_layout_name(target.layout));
+               !catalog_source_name(target.source).empty() && !target_layout_class_name(target).empty() &&
+               autoloot::post7c3::layout_supported(catalog_source_name(target.source), target_layout_class_name(target));
     }
 
     auto require_class(const TCHAR* role, const TCHAR* path) -> UClass*
@@ -755,8 +774,9 @@ namespace
             // AttachedItems is already empty (Wardrobe_24 shotgun / Table synthetic). The callback was
             // retried in a spawn/destroy loop until the process died mid-call. Mirror the live path's
             // array surgery on SavedItemsInShelves; skip the empty-attached callback.
+            // G12: no_layout targets use the source as layout stand-in; it has no AttachedItems.
             int32 attached_now{};
-            if (!read_layout_count(target.layout, attached_now) || attached_now != 0)
+            if (!target.no_layout && (!read_layout_count(target.layout, attached_now) || attached_now != 0))
             {
                 emit_log(STR("[AutoLootNativeProbe] SOURCE_REMOVE_FAIL reason=saved_only_attached_not_empty attached={}\n"), attached_now);
                 info_param->DestroyValue(info_value);
@@ -881,8 +901,22 @@ namespace
         // leaves SavedItemsInShelves unchanged while wiping the rest of AttachedItems
         // (FAIL source_removal_invariants shelves_before=N shelves_after=N attached_after=0).
         // Recover the SavedItems row surgically so the item is not stranded.
+        // G9 attached_only: no SavedItemsInShelves row backs the item; the callback must leave
+        // the saved array untouched (shelves_after == shelves_before).
         bool looted_after{};
         int32 shelves_after{};
+        if (target.attached_only)
+        {
+            if (!read_source_state(target.source, looted_after, shelves_after) ||
+                shelves_after != target.shelves_before)
+            {
+                emit_log(STR("[AutoLootNativeProbe] SOURCE_REMOVE_FAIL reason=attached_only_saved_drift shelves_before={} shelves_after={}\n"),
+                         target.shelves_before, shelves_after);
+                return false;
+            }
+            if constexpr (VerboseDiagnostics) emit_log(STR("[AutoLootNativeProbe] SOURCE_REMOVE_END call_count=1 path=attached_only\n"));
+            return true;
+        }
         if (!read_source_state(target.source, looted_after, shelves_after) ||
             shelves_after != target.shelves_before - 1)
         {
@@ -926,7 +960,10 @@ namespace
         return true;
     }
 
-    auto invoke_container_purge(UObject* source, UObject* layout, int32 expected_shelves) -> bool
+    auto find_detached_layouts_for_source(UObject* source, AActor* actor) -> std::vector<UObject*>;
+    auto all_bound_layouts_empty(UObject* source, AActor* actor) -> bool;
+
+    auto invoke_container_purge(UObject* source, UObject* layout, int32 expected_shelves, bool no_layout) -> bool
     {
         auto* function = UObjectGlobals::StaticFindObject<UFunction*>(nullptr, nullptr, PurgeContainerPath, false);
         auto* container_param = require_property<FObjectPropertyBase>(function, STR("OnContainerPurged"), STR("Container"));
@@ -939,7 +976,7 @@ namespace
         }
 
         int32 attached_before{};
-        if (!read_layout_count(layout, attached_before) || attached_before != 0)
+        if (!no_layout && (!read_layout_count(layout, attached_before) || attached_before != 0))
         {
             emit_log(STR("[AutoLootNativeProbe] PURGE_FAIL reason=layout_not_empty attached={}\n"), attached_before);
             return false;
@@ -953,9 +990,38 @@ namespace
         int32 shelves{};
         int32 attached_after{};
         const bool final_layout = expected_shelves == 0;
-        const bool state_ok = read_source_state(source, looted, shelves) && shelves == expected_shelves &&
-                              read_layout_count(layout, attached_after) && attached_after == 0 &&
-                              (final_layout ? looted : !looted);
+        bool base_ok = read_source_state(source, looted, shelves) && shelves == expected_shelves &&
+                       (no_layout || read_layout_count(layout, attached_after)) && attached_after == 0;
+        if (base_ok && final_layout && !looted)
+        {
+            // 2026-08-04 UE4SS.log: detached office furniture (Wardrobe_5/Crate4/Table6) BP
+            // OnContainerPurged never sets bLooted, so the final-layout check failed after a
+            // successful last removal and the spawned item was destroyed (lost). The game
+            // itself treats empty arrays as fully looted; set the flag explicitly.
+            // G9: only when every owner-bound layout is empty — multi-drawer furniture keeps
+            // live items in secondary layouts that bLooted=true would lock out again.
+            if (!all_bound_layouts_empty(source, static_cast<AActor*>(source)))
+            {
+                emit_log(STR("[AutoLootNativeProbe] PURGE_DEFER_LOOTED source={} layout={} reason=other_bound_layouts_not_empty\n"),
+                         exact_name(source), exact_name(layout));
+            }
+            else
+            {
+                auto* looted_property = CastField<FBoolProperty>(source->GetPropertyByNameInChain(STR("bLooted")));
+                if (looted_property)
+                {
+                    looted_property->SetPropertyValueInContainer(source, true);
+                    looted = true;
+                    emit_log(STR("[AutoLootNativeProbe] PURGE_SET_LOOTED source={} layout={}\n"), exact_name(source), exact_name(layout));
+                }
+                else
+                {
+                    base_ok = false;
+                }
+            }
+        }
+        // G9: deferring bLooted while other drawers still hold items is a valid non-terminal state.
+        const bool state_ok = base_ok && (final_layout ? looted || !all_bound_layouts_empty(source, static_cast<AActor*>(source)) : !looted);
         emit_log(STR("[AutoLootNativeProbe] PURGE_CALL result={} source={} layout={} final_layout={} bLooted={} shelves={} attached={}\n"),
                  state_ok, exact_name(source), exact_name(layout), final_layout, looted, shelves, attached_after);
         return state_ok;
@@ -1025,7 +1091,8 @@ namespace
                                    FArrayProperty* source_items_property,
                                    FIntProperty* source_amount_property,
                                    FObjectPropertyBase* source_asset_property,
-                                   UClass* pickup_base_class) -> AcquisitionTarget
+                                   UClass* pickup_base_class,
+                                   bool no_layout) -> AcquisitionTarget
     {
         AcquisitionTarget target{};
         if (!source || !layout || !actor || !source_items_property || !source_amount_property || !source_asset_property ||
@@ -1074,6 +1141,7 @@ namespace
             candidate.shelves_before = shelves;
             candidate.attached_before = 0;
             candidate.looted_before = looted;
+            candidate.no_layout = no_layout;
             candidate.record_fingerprint = source_record_fingerprint(candidate);
 
             auto descriptor = catalog_descriptor(candidate);
@@ -1085,6 +1153,30 @@ namespace
             return candidate;
         }
         return {};
+    }
+
+    // G12 2026-08-05 UE4SS.log: closed office furniture (Table2_2/Table3_5/Table4/Table5/
+    // Wardrobe_2/Wardrobe_8) owns NO layout actor until the player opens it manually — the
+    // layout only appears inside OnContainerRemovedItem at open time, so the detached-layout
+    // search skipped them forever (no_level_layout). The attached_before=0 transaction touches
+    // SavedItemsInShelves only; resolve it against the source itself and skip layout guards.
+    auto resolve_saved_only_without_layout(UObject* source, AActor* actor, bool looted, int32 shelves, UClass* pickup_base_class) -> AcquisitionTarget
+    {
+        if (!source || !actor || !pickup_base_class) return {};
+        auto* source_items_property = CastField<FArrayProperty>(source->GetPropertyByNameInChain(STR("SavedItemsInShelves")));
+        auto* source_inner = source_items_property ? CastField<FStructProperty>(source_items_property->GetInner()) : nullptr;
+        auto* source_info = source_inner && source_inner->GetStruct() ? source_inner->GetStruct().Get() : nullptr;
+        auto* source_amount_property = source_info ? CastField<FIntProperty>(source_info->GetPropertyByNameInChain(STR("Amount"))) : nullptr;
+        auto* source_asset_property = source_info ? CastField<FObjectPropertyBase>(source_info->GetPropertyByNameInChain(STR("ItemClass"))) : nullptr;
+        if (!source_items_property || !source_amount_property || !source_asset_property) return {};
+        auto target = resolve_saved_only_target(source, source, actor, looted, shelves, source_items_property,
+                                               source_amount_property, source_asset_property, pickup_base_class, true);
+        if (target.source)
+        {
+            emit_log(STR("[AutoLootNativeProbe] SAVED_ONLY_NO_LAYOUT source={} item_asset={} amount={} source_index={} shelves={}\n"),
+                     exact_name(source), exact_name(target.item_asset), target.amount, target.source_index, shelves);
+        }
+        return target;
     }
 
     auto resolve_corpse_target(UObject* source, UClass* pickup_base_class) -> AcquisitionTarget
@@ -1215,21 +1307,22 @@ namespace
         return false;
     }
 
-    auto find_detached_layout_for_source(UObject* source, AActor* actor) -> UObject*
+    // G9: Wardrobe_5/Crate4 own one layout per drawer (bound_matches>=2). The mod must see
+    // every owner-bound layout; processing only the first left whole drawers unlooted.
+    auto find_detached_layouts_for_source(UObject* source, AActor* actor) -> std::vector<UObject*>
     {
-        if (!source || !actor || !actor->GetLevel()) return nullptr;
+        std::vector<UObject*> result{};
+        if (!source || !actor || !actor->GetLevel()) return result;
         const auto source_class = catalog_source_name(source);
-        if (source_class.empty()) return nullptr;
+        if (source_class.empty()) return result;
 
-        UObject* bound{};
-        int32 bound_count{};
         UObject* unique{};
         int32 unique_count{};
-        const int32 limit = UObjectArray::GetNumElements();
-        for (int32 index = 0; index < limit; ++index)
+        // 2026-08-05: consume the incrementally-populated cache instead of walking the full
+        // UObjectArray here (that walk was the confirmed stutter source; see LayoutObjectCache).
+        for (auto& weak_object : LayoutObjectCache)
         {
-            auto* item = UObjectArray::IndexToObject(index);
-            auto* object = item && item->IsValid(false) ? item->GetUObject() : nullptr;
+            auto* object = weak_object.Get();
             if (!object || object->HasAnyFlags(RF_ClassDefaultObject) || object->GetOuterPrivate() != actor->GetLevel())
             {
                 continue;
@@ -1237,30 +1330,159 @@ namespace
             if (!autoloot::post7c3::layout_supported(source_class, catalog_layout_name(object))) continue;
             ++unique_count;
             if (unique_count == 1) unique = object;
-            if (layout_bound_to_source(object, source))
-            {
-                ++bound_count;
-                if (!bound) bound = object;
-            }
+            if (layout_bound_to_source(object, source)) result.push_back(object);
         }
 
-        if (bound)
+        if (!result.empty())
         {
-            // G8b: Table nightstands own multiple drawer layouts (bound_matches>=2). SAVED_ONLY
-            // only needs one owner-bound layout; skipping them left loot in the drawers.
+            // G8b/G9: Table nightstands own multiple drawer layouts. Enumerate ALL of them; any
+            // drawer may still hold live AttachedItems after the first was emptied + bLooted.
             emit_log(STR("[AutoLootNativeProbe] LAYOUT_FALLBACK source={} layout={} bind=owner_or_lootbox level_matches={} bound_matches={}\n"),
-                     exact_name(source), exact_name(bound), unique_count, bound_count);
-            return bound;
+                     exact_name(source), exact_name(result.front()), unique_count, static_cast<int32>(result.size()));
+            return result;
         }
         if (unique_count == 1)
         {
             emit_log(STR("[AutoLootNativeProbe] LAYOUT_FALLBACK source={} layout={} bind=unique_level_class level_matches=1\n"),
                      exact_name(source), exact_name(unique));
-            return unique;
+            result.push_back(unique);
+            return result;
         }
         emit_log(STR("[AutoLootNativeProbe] LAYOUT_FALLBACK_SKIP source={} reason={} level_matches={}\n"),
                  exact_name(source), unique_count == 0 ? STR("no_level_layout") : STR("ambiguous_level_class"), unique_count);
-        return nullptr;
+        return result;
+    }
+
+    // G9: bLooted must only be forced once EVERY owner-bound layout is empty; otherwise the
+    // remaining drawers get locked behind the same premature terminal flag that hid them before.
+    auto all_bound_layouts_empty(UObject* source, AActor* actor) -> bool
+    {
+        for (auto* layout : find_detached_layouts_for_source(source, actor))
+        {
+            int32 attached{};
+            if (!read_layout_count(layout, attached) || attached > 0) return false;
+        }
+        return true;
+    }
+
+    auto resolve_target_from_layout(UObject* source,
+                                    AActor* actor,
+                                    UObject* layout,
+                                    bool looted,
+                                    int32 shelves,
+                                    UClass* pickup_base_class,
+                                    bool& ambiguous) -> AcquisitionTarget
+    {
+        ambiguous = false;
+        AcquisitionTarget target{};
+        auto* attached_property = CastField<FArrayProperty>(layout->GetPropertyByNameInChain(STR("AttachedItems")));
+        auto* attached_inner = attached_property ? CastField<FStructProperty>(attached_property->GetInner()) : nullptr;
+        auto* spawn_info = attached_inner && attached_inner->GetStruct() ? attached_inner->GetStruct().Get() : nullptr;
+        auto* amount_property = spawn_info ? CastField<FIntProperty>(spawn_info->GetPropertyByNameInChain(STR("Amount"))) : nullptr;
+        auto* asset_property = spawn_info ? CastField<FObjectPropertyBase>(spawn_info->GetPropertyByNameInChain(STR("ItemClass"))) : nullptr;
+        auto* loaded_property = spawn_info ? CastField<FObjectPropertyBase>(spawn_info->GetPropertyByNameInChain(STR("LoadedPickupableClass"))) : nullptr;
+        auto* source_items_property = CastField<FArrayProperty>(source->GetPropertyByNameInChain(STR("SavedItemsInShelves")));
+        auto* source_inner = source_items_property ? CastField<FStructProperty>(source_items_property->GetInner()) : nullptr;
+        auto* source_info = source_inner && source_inner->GetStruct() ? source_inner->GetStruct().Get() : nullptr;
+        auto* source_amount_property = source_info ? CastField<FIntProperty>(source_info->GetPropertyByNameInChain(STR("Amount"))) : nullptr;
+        auto* source_asset_property = source_info ? CastField<FObjectPropertyBase>(source_info->GetPropertyByNameInChain(STR("ItemClass"))) : nullptr;
+        if (!attached_property || !amount_property || !asset_property || !loaded_property || !source_items_property ||
+            !source_amount_property || !source_asset_property)
+        {
+            return target;
+        }
+
+        FScriptArrayHelper_InContainer attached{attached_property, layout};
+        FScriptArrayHelper_InContainer source_items{source_items_property, source};
+        std::vector<SemanticSourceRecord> records;
+        records.reserve(source_items.Num());
+        for (int32 index = 0; index < source_items.Num(); ++index)
+        {
+            auto* entry = source_items.GetRawPtr(index);
+            records.push_back({read_object(source_asset_property, entry), read_int(source_amount_property, entry)});
+        }
+
+        for (int32 shelf_index = 0; shelf_index < attached.Num(); ++shelf_index)
+        {
+            auto* entry = attached.GetRawPtr(shelf_index);
+            const int32 amount = read_int(amount_property, entry);
+            auto* asset = read_object(asset_property, entry);
+            auto* loaded = static_cast<UClass*>(read_object(loaded_property, entry));
+            if ((!loaded || !loaded->IsChildOf(pickup_base_class)) && asset)
+            {
+                const auto inventory_data = catalog_item_data_name(asset);
+                const auto pickup_name = autoloot::post7c3::item_class_for_data(inventory_data);
+                if (!pickup_name.empty() && autoloot::post7c3::item_supported(inventory_data, pickup_name, amount))
+                {
+                    loaded = find_catalog_pickup_class(pickup_name, pickup_base_class);
+                }
+            }
+            int32 source_index{-1};
+            const int32 semantic_matches = count_semantic_matches(records, asset, amount, source_index);
+            if (semantic_matches > 1)
+            {
+                ambiguous = true;
+                return {};
+            }
+            const bool catalog_supported = [&]() {
+                if (amount <= 0 || !asset) return false;
+                const auto inventory_data = catalog_item_data_name(asset);
+                const auto pickup_name = autoloot::post7c3::item_class_for_data(inventory_data);
+                return !inventory_data.empty() && !pickup_name.empty() &&
+                       autoloot::post7c3::item_supported(inventory_data, pickup_name, amount);
+            }();
+            if (amount <= 0 || !asset || !loaded || !loaded->IsChildOf(pickup_base_class) ||
+                (semantic_matches != 1 && !catalog_supported))
+            {
+                continue;
+            }
+
+            AcquisitionTarget candidate{};
+            candidate.source = source;
+            candidate.source_world = actor->GetWorld();
+            candidate.source_level = actor->GetLevel();
+            candidate.layout = layout;
+            candidate.item_asset = asset;
+            candidate.loaded_class = loaded;
+            candidate.amount = amount;
+            candidate.shelf_index = shelf_index;
+            candidate.source_index = source_index;
+            candidate.shelves_before = shelves;
+            candidate.attached_before = attached.Num();
+            candidate.looted_before = looted;
+            // G9: residual drawer items live only in a secondary layout's AttachedItems with no
+            // SavedItemsInShelves row behind them; transact without touching the saved array.
+            candidate.attached_only = semantic_matches == 0;
+            candidate.record_fingerprint = source_record_fingerprint(candidate);
+
+            auto descriptor = catalog_descriptor(candidate);
+            descriptor.fingerprint = orchestration_source_key(candidate);
+            if (!runtime_target_supported(candidate) || !autoloot::post7c3::allowlisted(descriptor))
+            {
+                emit_log(STR("[AutoLootNativeProbe] ITEM_SKIPPED_UNSUPPORTED source={} shelf_index={} item_asset={} loaded_class={} amount={} action=continue_supported_items\n"),
+                         exact_name(source), shelf_index, exact_name(asset), exact_name(loaded), amount);
+                continue;
+            }
+            if (candidate.attached_only)
+            {
+                emit_log(STR("[AutoLootNativeProbe] ATTACHED_ONLY_CANDIDATE source={} layout={} shelf_index={} item_asset={} amount={} attached={} shelves={}\n"),
+                         exact_name(source), exact_name(layout), shelf_index, exact_name(asset), amount, attached.Num(), shelves);
+            }
+            return candidate;
+        }
+
+        // R47/Box11: AttachedItems can be a lazy subset. If every attached row is unsupported
+        // (or attached is empty), still resolve allowlisted SavedItemsInShelves rows.
+        return resolve_saved_only_target(source,
+                                         layout,
+                                         actor,
+                                         looted,
+                                         shelves,
+                                         source_items_property,
+                                         source_amount_property,
+                                         source_asset_property,
+                                         pickup_base_class,
+                                         false);
     }
 
     auto resolve_target_from_source(UObject* source, UClass* pickup_base_class) -> AcquisitionTarget
@@ -1281,7 +1503,7 @@ namespace
 
         bool looted{};
         int32 shelves{};
-        if (!read_source_state(source, looted, shelves) || looted || shelves <= 0)
+        if (!read_source_state(source, looted, shelves))
         {
             return target;
         }
@@ -1290,34 +1512,49 @@ namespace
         auto* shelf = shelf_property ? read_object(shelf_property, source) : nullptr;
         auto* containers_property = CastField<FArrayProperty>(shelf ? shelf->GetPropertyByNameInChain(STR("AttachedContainers")) : nullptr);
         auto* container_inner = containers_property ? CastField<FObjectPropertyBase>(containers_property->GetInner()) : nullptr;
+        FScriptArrayHelper_InContainer containers{containers_property, shelf};
+
+        if (looted || shelves <= 0)
+        {
+            // G9: bLooted/shelves=0 is not terminal for multi-drawer furniture. A secondary
+            // owner-bound layout can still hold live AttachedItems (Wardrobe_5/Crate4 leftovers
+            // manually looted at 23:42 with ShelfIndex=1 after the mod set bLooted=true).
+            if (shelf && containers.Num() == 0)
+            {
+                for (auto* layout : find_detached_layouts_for_source(source, actor))
+                {
+                    bool ambiguous{};
+                    auto live = resolve_target_from_layout(source, actor, layout, looted, shelves, pickup_base_class, ambiguous);
+                    if (ambiguous) return {};
+                    if (live.source) return live;
+                }
+            }
+            return target;
+        }
         if (!shelf || !containers_property || !container_inner)
         {
             return target;
         }
 
-        FScriptArrayHelper_InContainer containers{containers_property, shelf};
         // F11 2026-08-04: closed office furniture reports AttachedContainers=0 with live SavedItems.
         if (containers.Num() == 0)
         {
-            auto* source_items_property = CastField<FArrayProperty>(source->GetPropertyByNameInChain(STR("SavedItemsInShelves")));
-            auto* source_inner = source_items_property ? CastField<FStructProperty>(source_items_property->GetInner()) : nullptr;
-            auto* source_info = source_inner && source_inner->GetStruct() ? source_inner->GetStruct().Get() : nullptr;
-            auto* source_amount_property = source_info ? CastField<FIntProperty>(source_info->GetPropertyByNameInChain(STR("Amount"))) : nullptr;
-            auto* source_asset_property = source_info ? CastField<FObjectPropertyBase>(source_info->GetPropertyByNameInChain(STR("ItemClass"))) : nullptr;
-            auto* layout = find_detached_layout_for_source(source, actor);
-            if (layout && source_items_property && source_amount_property && source_asset_property)
+            // 2026-08-04 UE4SS.log: the fallback layout can still hold live AttachedItems while
+            // AttachedContainers is unregistered (Tables/Wardrobe_8 resolved SAVED_ONLY with
+            // attached_before=0 forever and validate rejected it silently). Resolve through the
+            // same attached-first path so attached_before matches the live layout state.
+            // G9: iterate EVERY owner-bound layout (one per drawer), not just the first.
+            for (auto* layout : find_detached_layouts_for_source(source, actor))
             {
-                auto saved_only = resolve_saved_only_target(source,
-                                                           layout,
-                                                           actor,
-                                                           looted,
-                                                           shelves,
-                                                           source_items_property,
-                                                           source_amount_property,
-                                                           source_asset_property,
-                                                           pickup_base_class);
-                if (saved_only.source) return saved_only;
+                bool ambiguous{};
+                auto live = resolve_target_from_layout(source, actor, layout, looted, shelves, pickup_base_class, ambiguous);
+                if (ambiguous) return {};
+                if (live.source) return live;
             }
+            // G12: no layout actor exists yet (closed furniture). SavedItemsInShelves still
+            // holds the loot — transact directly via the proven attached_before=0 path.
+            auto saved = resolve_saved_only_without_layout(source, actor, looted, shelves, pickup_base_class);
+            if (saved.source) return saved;
             return target;
         }
         for (int32 container_index = 0; container_index < containers.Num(); ++container_index)
@@ -1328,101 +1565,18 @@ namespace
             {
                 continue;
             }
-            auto* attached_property = CastField<FArrayProperty>(layout->GetPropertyByNameInChain(STR("AttachedItems")));
-            auto* attached_inner = attached_property ? CastField<FStructProperty>(attached_property->GetInner()) : nullptr;
-            auto* spawn_info = attached_inner && attached_inner->GetStruct() ? attached_inner->GetStruct().Get() : nullptr;
-            auto* amount_property = spawn_info ? CastField<FIntProperty>(spawn_info->GetPropertyByNameInChain(STR("Amount"))) : nullptr;
-            auto* asset_property = spawn_info ? CastField<FObjectPropertyBase>(spawn_info->GetPropertyByNameInChain(STR("ItemClass"))) : nullptr;
-            auto* loaded_property = spawn_info ? CastField<FObjectPropertyBase>(spawn_info->GetPropertyByNameInChain(STR("LoadedPickupableClass"))) : nullptr;
-            auto* source_items_property = CastField<FArrayProperty>(source->GetPropertyByNameInChain(STR("SavedItemsInShelves")));
-            auto* source_inner = source_items_property ? CastField<FStructProperty>(source_items_property->GetInner()) : nullptr;
-            auto* source_info = source_inner && source_inner->GetStruct() ? source_inner->GetStruct().Get() : nullptr;
-            auto* source_amount_property = source_info ? CastField<FIntProperty>(source_info->GetPropertyByNameInChain(STR("Amount"))) : nullptr;
-            auto* source_asset_property = source_info ? CastField<FObjectPropertyBase>(source_info->GetPropertyByNameInChain(STR("ItemClass"))) : nullptr;
-            if (!attached_property || !amount_property || !asset_property || !loaded_property || !source_items_property ||
-                !source_amount_property || !source_asset_property)
-            {
-                continue;
-            }
-
-            FScriptArrayHelper_InContainer attached{attached_property, layout};
-            FScriptArrayHelper_InContainer source_items{source_items_property, source};
-            std::vector<SemanticSourceRecord> records;
-            records.reserve(source_items.Num());
-            for (int32 index = 0; index < source_items.Num(); ++index)
-            {
-                auto* entry = source_items.GetRawPtr(index);
-                records.push_back({read_object(source_asset_property, entry), read_int(source_amount_property, entry)});
-            }
-
-            for (int32 shelf_index = 0; shelf_index < attached.Num(); ++shelf_index)
-            {
-                auto* entry = attached.GetRawPtr(shelf_index);
-                const int32 amount = read_int(amount_property, entry);
-                auto* asset = read_object(asset_property, entry);
-                auto* loaded = static_cast<UClass*>(read_object(loaded_property, entry));
-                if ((!loaded || !loaded->IsChildOf(pickup_base_class)) && asset)
-                {
-                    const auto inventory_data = catalog_item_data_name(asset);
-                    const auto pickup_name = autoloot::post7c3::item_class_for_data(inventory_data);
-                    if (!pickup_name.empty() && autoloot::post7c3::item_supported(inventory_data, pickup_name, amount))
-                    {
-                        loaded = find_catalog_pickup_class(pickup_name, pickup_base_class);
-                    }
-                }
-                int32 source_index{-1};
-                const int32 semantic_matches = count_semantic_matches(records, asset, amount, source_index);
-                if (semantic_matches > 1) return {};
-                if (amount <= 0 || !asset || !loaded || !loaded->IsChildOf(pickup_base_class) || semantic_matches != 1)
-                {
-                    continue;
-                }
-
-                AcquisitionTarget candidate{};
-                candidate.source = source;
-                candidate.source_world = actor->GetWorld();
-                candidate.source_level = actor->GetLevel();
-                candidate.layout = layout;
-                candidate.item_asset = asset;
-                candidate.loaded_class = loaded;
-                candidate.amount = amount;
-                candidate.shelf_index = shelf_index;
-                candidate.source_index = source_index;
-                candidate.shelves_before = shelves;
-                candidate.attached_before = attached.Num();
-                candidate.looted_before = looted;
-                candidate.record_fingerprint = source_record_fingerprint(candidate);
-
-                auto descriptor = catalog_descriptor(candidate);
-                descriptor.fingerprint = orchestration_source_key(candidate);
-                if (!runtime_target_supported(candidate) || !autoloot::post7c3::allowlisted(descriptor))
-                {
-                    emit_log(STR("[AutoLootNativeProbe] ITEM_SKIPPED_UNSUPPORTED source={} shelf_index={} item_asset={} loaded_class={} amount={} action=continue_supported_items\n"),
-                             exact_name(source), shelf_index, exact_name(asset), exact_name(loaded), amount);
-                    continue;
-                }
-                return candidate;
-            }
-
-            // R47/Box11: AttachedItems can be a lazy subset. If every attached row is unsupported
-            // (or attached is empty), still resolve allowlisted SavedItemsInShelves rows.
-            auto saved_only = resolve_saved_only_target(source,
-                                                       layout,
-                                                       actor,
-                                                       looted,
-                                                       shelves,
-                                                       source_items_property,
-                                                       source_amount_property,
-                                                       source_asset_property,
-                                                       pickup_base_class);
-            if (saved_only.source) return saved_only;
+            bool ambiguous{};
+            auto resolved = resolve_target_from_layout(source, actor, layout, looted, shelves, pickup_base_class, ambiguous);
+            if (ambiguous) return {};
+            if (resolved.source) return resolved;
         }
         return {};
     }
 
     auto validate_target_descriptor(const AcquisitionTarget& target) -> bool
     {
-        if (!target.source || !target.layout || !target.item_asset || target.shelf_index < 0 || target.source_index < 0 ||
+        if (!target.source || !target.layout || !target.item_asset || target.shelf_index < 0 ||
+            (target.source_index < 0 && !target.attached_only) ||
             target.attached_before < 0 || source_record_fingerprint(target) != target.record_fingerprint ||
             !runtime_target_supported(target))
         {
@@ -1472,7 +1626,8 @@ namespace
 
         bool looted{};
         int32 shelves{};
-        if (!read_source_state(target.source, looted, shelves) || looted || shelves != target.shelves_before)
+        if (!read_source_state(target.source, looted, shelves) || shelves != target.shelves_before ||
+            (!target.attached_only && looted))
         {
             return false;
         }
@@ -1486,16 +1641,24 @@ namespace
         {
             return false;
         }
-        FScriptArrayHelper_InContainer source_items{source_items_property, target.source};
-        if (target.source_index >= source_items.Num())
+        // G9 attached_only: no SavedItemsInShelves row backs this item; skip the saved-row guard.
+        if (!target.attached_only)
         {
-            return false;
+            FScriptArrayHelper_InContainer source_items{source_items_property, target.source};
+            if (target.source_index >= source_items.Num())
+            {
+                return false;
+            }
+            void* source_entry = source_items.GetRawPtr(target.source_index);
+            if (read_int(source_amount_property, source_entry) != target.amount || read_object(source_asset_property, source_entry) != target.item_asset)
+            {
+                return false;
+            }
         }
-        void* source_entry = source_items.GetRawPtr(target.source_index);
-        if (read_int(source_amount_property, source_entry) != target.amount || read_object(source_asset_property, source_entry) != target.item_asset)
-        {
-            return false;
-        }
+
+        // G12: the level holds no layout actor for this source; the saved-row guard above is
+        // the only live state that exists. Skip the AttachedItems contract on the stand-in.
+        if (target.no_layout) return true;
 
         auto* attached_property = require_property<FArrayProperty>(target.layout, STR("layout_guard"), STR("AttachedItems"));
         auto* attached_inner = attached_property ? CastField<FStructProperty>(attached_property->GetInner()) : nullptr;
@@ -1653,6 +1816,13 @@ namespace
                 m_source_candidates.emplace_back(object);
             }
 
+            // 2026-08-05: piggyback layout-object discovery on this already-budgeted pass so
+            // find_detached_layouts_for_source can look them up without its own full scan.
+            if (!catalog_layout_name(object).empty() && LayoutObjectCache.size() < IncrementalQueueCapacity)
+            {
+                LayoutObjectCache.emplace_back(object);
+            }
+
             const bool floor = class_name == STR("BP_Pickable_consumable_aid_small_C") ||
                                class_name == STR("BP_Pickable_consumable_aid_medium_C") ||
                                class_name == STR("BP_Pickable_sguschenka_C") ||
@@ -1707,6 +1877,7 @@ namespace
                 m_scan_pool.Reset();
                 m_scan_inventory_matches = 0;
                 m_scan_pool_matches = 0;
+                LayoutObjectCache.clear();
                 if (m_scan_limit <= 0)
                 {
                     complete_scan_generation(now);
@@ -1747,7 +1918,18 @@ namespace
             {
                 view.target = resolve_target_from_source(active_source, pickup_base_class);
                 if (view.target.source) return view;
-                m_active_source.Reset();
+                // 2026-08-05 UE4SS.log: Wardrobe_5/Table5/Table6/Crate4 have a second owner-bound
+                // layout (bound_matches=2) whose AttachedItems populates later than the first
+                // drawer's. Resetting active_source after ONE empty resolve dropped it back into
+                // the global m_source_candidates FIFO, which is congested by hundreds of already-
+                // drained sources (LAYOUT_FALLBACK_SKIP repeats every scan pass) and starved the
+                // re-check for tens of seconds -> reported as "some objects loot, some don't". Keep
+                // retrying every tick (cheap: G10 cache) while any bound layout still exists.
+                bool active_looted{};
+                int32 active_shelves{};
+                const bool still_worth_retry = read_source_state(active_source, active_looted, active_shelves) &&
+                    !all_bound_layouts_empty(active_source, static_cast<AActor*>(active_source));
+                if (!still_worth_retry) m_active_source.Reset();
             }
 
             for (int32 attempts = 0; attempts < 4 && !m_source_candidates.empty(); ++attempts)
@@ -1821,6 +2003,7 @@ namespace
             m_scan_pool.Reset();
             m_scan_inventory_matches = 0;
             m_scan_pool_matches = 0;
+            LayoutObjectCache.clear();
             if (m_scan_limit <= 0)
             {
                 complete_scan_generation(now);
@@ -2160,7 +2343,9 @@ namespace
                 const bool initialized = read_actor_item(spawned, initialized_asset, initialized_amount) && initialized_asset == target.item_asset && initialized_amount == target.amount;
                 bool looted_after{};
                 int32 shelves_after{};
-                const bool source_unchanged = read_source_state(target.source, looted_after, shelves_after) && !looted_after && shelves_after == target.shelves_before;
+                const bool source_unchanged = read_source_state(target.source, looted_after, shelves_after) &&
+                                              shelves_after == target.shelves_before &&
+                                              (!looted_after || target.attached_only);
                 if constexpr (VerboseDiagnostics)
                 {
                     emit_log(STR("[AutoLootNativeProbe] INITIALIZED object={} result={} item_asset={} amount={} source_unchanged={} shelves_after={}\n"),
@@ -2223,16 +2408,18 @@ namespace
                 int32 shelves_removed{};
                 int32 attached_removed{};
                 bool source_state_ok = read_source_state(target.source, looted_removed, shelves_removed);
-                if (source_state_ok && looted_removed && shelves_removed > 0)
+                if (source_state_ok && looted_removed && shelves_removed > 0 && !target.attached_only)
                 {
                     clear_premature_looted_flag(target.source);
                     source_state_ok = read_source_state(target.source, looted_removed, shelves_removed);
                 }
-                const bool source_removed = source_state_ok && (!looted_removed || shelves_removed == 0) && shelves_removed == target.shelves_before - 1 &&
-                                            read_layout_count(target.layout, attached_removed) &&
+                const bool shelves_expectation = target.attached_only ? shelves_removed == target.shelves_before
+                                                                        : shelves_removed == target.shelves_before - 1;
+                const bool source_removed = source_state_ok && (!looted_removed || shelves_removed == 0) && shelves_expectation &&
+                                            (target.no_layout || read_layout_count(target.layout, attached_removed)) &&
                                             (attached_removed == (target.attached_before > 0 ? target.attached_before - 1 : 0) ||
                                              // Callback wiped remaining AttachedItems; leftover SavedItems rows continue via SAVED_ONLY.
-                                             (target.attached_before > 0 && attached_removed == 0));
+                                             (target.attached_before > 0 && attached_removed == 0 && !target.attached_only));
                 if constexpr (VerboseDiagnostics)
                 {
                     emit_log(STR("[AutoLootNativeProbe] SOURCE_REMOVE_CHECK result={} bLooted={} shelves_before={} shelves_after={} attached_before={} attached_after={}\n"),
@@ -2260,7 +2447,7 @@ namespace
                     }
                     else
                     {
-                        purge_ok = invoke_container_purge(target.source, target.layout, shelves_removed);
+                        purge_ok = invoke_container_purge(target.source, target.layout, shelves_removed, target.no_layout);
                     }
                 }
                 if (!purge_ok)
@@ -2292,7 +2479,11 @@ namespace
                     clear_premature_looted_flag(target.source);
                     read_source_state(target.source, looted_post, shelves_post);
                 }
-                const bool layout_post = read_layout_count(target.layout, attached_post);
+                const bool layout_post = target.no_layout || read_layout_count(target.layout, attached_post);
+                // G9: with shelves=0 and other bound layouts still holding items, bLooted stays
+                // false by design (PURGE_DEFER_LOOTED); that is a valid completion state.
+                const bool deferred_terminal = shelves_post == 0 && !looted_post &&
+                                               !all_bound_layouts_empty(target.source, static_cast<AActor*>(target.source));
                 if constexpr (VerboseDiagnostics)
                 {
                     emit_log(STR("[AutoLootNativeProbe] INVENTORY_CALL return_word={} actor_still_known={} actor_name={} source_ok={} bLooted={} shelves={} layout_ok={} attached={} notification=true\n"),
@@ -2304,7 +2495,7 @@ namespace
                     spawned->K2_DestroyActor();
                     emit_log(STR("[AutoLootNativeProbe] CLEANUP object={} fallback_destroy_called=true\n"), exact_name(spawned));
                 }
-                const bool completion_state = shelves_post == 0 ? looted_post : !looted_post;
+                const bool completion_state = shelves_post == 0 ? (looted_post || deferred_terminal) : !looted_post;
                 const int32 expected_attached_after = target.attached_before > 0 ? target.attached_before - 1 : 0;
                 const bool attached_ok =
                     attached_post == expected_attached_after || (target.attached_before > 0 && attached_post == 0);
