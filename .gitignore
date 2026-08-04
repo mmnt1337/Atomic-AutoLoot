@@ -1,0 +1,52 @@
+# Build products
+**/build/
+**/build-*/
+**/out/
+**/bin/
+**/lib/
+*.dll
+*.exe
+*.lib
+*.pdb
+*.obj
+*.ilk
+
+# CMake and IDE state
+CMakeUserPresets.json
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Local research and runtime artifacts
+.agents/
+backups/
+reports/
+AutoLootProbe/
+AutoLootStage4*/
+AutoLootTrace/
+AutoLootSingleBoxTest/
+tmp_*.txt
+*.log
+!UE4SS.log
+memory*.txt
+memory*.md
+TASK_STATE.md
+AGENTS.md
+AUTOLOOT_7C_X1_LOGIC.md
+AUTOLOOT_TRACE_*.md
+
+# Canonical project context must remain visible to Repomix/MCP.
+!AGENTS.md
+!memory.md
+!TASK_STATE.md
+!AUTOLOOT_TRACE_AGENT_INDEX.md
+
+# Accidental nested clone / worktree copy
+/AH AutoLoot/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini

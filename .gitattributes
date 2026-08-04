@@ -1,0 +1,9 @@
+* text=auto
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.lua text eol=lf
+.gitmodules text eol=lf
+*.dll binary
+*.pdb binary

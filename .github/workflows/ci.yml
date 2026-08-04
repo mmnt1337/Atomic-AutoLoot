@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  orchestration-self-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build self-test
+        run: >-
+          c++ -std=c++23 -Wall -Wextra -Wpedantic
+          AutoLootNativeProbe/tests/orchestration_selftest.cpp
+          -o orchestration_selftest
+      - name: Run self-test
+        run: ./orchestration_selftest
