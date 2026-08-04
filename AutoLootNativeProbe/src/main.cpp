@@ -32,7 +32,7 @@ namespace
 
     constexpr auto Marker = STR("ALNP_7C_CONTAINER_X1C_20260725_C838A8AC");
     constexpr auto OrchestrationMarker = STR("ALNP_AUTO_X1_20260726_C838A8AC");
-    constexpr auto BuildVariantMarker = STR("ALNP_G6_SKIP_DOUBLE_PURGE_20260804_C838A8AC");
+        constexpr auto BuildVariantMarker = STR("ALNP_G8B_MULTI_BOUND_LAYOUT_20260804_C838A8AC");
     constexpr bool VerboseDiagnostics = false;
     constexpr int32 IncrementalScanMaxSlots = 2048;
     constexpr int64 IncrementalScanBudgetUs = 750;
@@ -253,6 +253,8 @@ namespace
         if (name == STR("BP_Pickupable_Shotgun_Ammo_single_C")) return "BP_Pickupable_Shotgun_Ammo_single_C";
         if (name == STR("BP_Pickupable_Shotgun_Ammo_Magazine_C")) return "BP_Pickupable_Shotgun_Ammo_Magazine_C";
         if (name == STR("BP_Pickupable_AK47_Ammo_Magazine_C")) return "BP_Pickupable_AK47_Ammo_Magazine_C";
+        // 2026-08-04 F11 seq2 Utka: ContinuousPickup grabbed this world drop; missing from catalog.
+        if (name == STR("BP_Pickupable_Krepysh_Ammo_Single_C")) return "BP_Pickupable_Krepysh_Ammo_Single_C";
         if (name == STR("BP_Pickable_CapsuleJelly_C")) return "BP_Pickable_CapsuleJelly_C";
         if (name == STR("BP_Pickupable_Metal_Parts_C")) return "BP_Pickupable_Metal_Parts_C";
         if (name == STR("BP_Pickable_Synthetic_Material_Resource_C")) return "BP_Pickable_Synthetic_Material_Resource_C";
@@ -682,9 +684,9 @@ namespace
         const bool ok = read_corpse_source_state(target.source, target.loot_component, looted, shelves) &&
                         shelves == target.shelves_before - 1 && read_layout_count(target.layout, attached_count) &&
                         attached_count == target.attached_before - 1;
-        // 2026-08-04 F11 after auto-loot: SavedItems=0/bIsEnabled=false still left
-        // LootBoxComponent.InventoryData with one residual entry and the corpse stayed
-        // ALT-highlighted. Clear InventoryData when depleted.
+        // 2026-08-04 F11: SavedItems=0 + bIsEnabled=false + InventoryData=0 still left
+        // ALT highlight on Vovs. AHAICharacter.bIsLooted (SaveGame) is the scanner gate;
+        // LootBoxComponent fields alone are insufficient.
         if (ok && shelves == 0)
         {
             if (auto* enabled_property =
@@ -706,6 +708,13 @@ namespace
                     emit_log(STR("[AutoLootNativeProbe] CORPSE_CLEAR_INVENTORY_DATA source={} result={} before={} after={}\n"),
                              exact_name(target.source), cleared, inventory_before, inventory_after);
                 }
+            }
+            if (auto* ai_looted_property =
+                    CastField<FBoolProperty>(target.source->GetPropertyByNameInChain(STR("bIsLooted"))))
+            {
+                ai_looted_property->SetPropertyValueInContainer(target.source, true);
+                emit_log(STR("[AutoLootNativeProbe] CORPSE_MARK_AI_LOOTED source={} bIsLooted=true shelves=0\n"),
+                         exact_name(target.source));
             }
         }
         emit_log(STR("[AutoLootNativeProbe] CORPSE_REMOVE result={} shelves_before={} shelves_after={} attached_before={} attached_after={} looted={}\n"),
@@ -1190,6 +1199,70 @@ namespace
         return {};
     }
 
+    // 2026-08-04 F11 OfficeHouse furniture: Wardrobe_23/Table/Wardrobe_24 keep AttachedContainers=0
+    // even while SavedItemsInShelves>0. Manual loot still receives a same-level layout via
+    // OnContainerRemovedItem. Bind by Owner/LootBox when present. Tables often own 2+ layouts
+    // (one per drawer); any bound layout is enough for SAVED_ONLY. Unique class+level is a
+    // last resort only when no owner bind exists.
+    auto layout_bound_to_source(UObject* layout, UObject* source) -> bool
+    {
+        if (!layout || !source) return false;
+        for (const TCHAR* field_name : {STR("LootBox"), STR("OwningLootBox"), STR("ParentLootBox"), STR("Owner")})
+        {
+            auto* property = CastField<FObjectPropertyBase>(layout->GetPropertyByNameInChain(field_name));
+            if (property && read_object(property, layout) == source) return true;
+        }
+        return false;
+    }
+
+    auto find_detached_layout_for_source(UObject* source, AActor* actor) -> UObject*
+    {
+        if (!source || !actor || !actor->GetLevel()) return nullptr;
+        const auto source_class = catalog_source_name(source);
+        if (source_class.empty()) return nullptr;
+
+        UObject* bound{};
+        int32 bound_count{};
+        UObject* unique{};
+        int32 unique_count{};
+        const int32 limit = UObjectArray::GetNumElements();
+        for (int32 index = 0; index < limit; ++index)
+        {
+            auto* item = UObjectArray::IndexToObject(index);
+            auto* object = item && item->IsValid(false) ? item->GetUObject() : nullptr;
+            if (!object || object->HasAnyFlags(RF_ClassDefaultObject) || object->GetOuterPrivate() != actor->GetLevel())
+            {
+                continue;
+            }
+            if (!autoloot::post7c3::layout_supported(source_class, catalog_layout_name(object))) continue;
+            ++unique_count;
+            if (unique_count == 1) unique = object;
+            if (layout_bound_to_source(object, source))
+            {
+                ++bound_count;
+                if (!bound) bound = object;
+            }
+        }
+
+        if (bound)
+        {
+            // G8b: Table nightstands own multiple drawer layouts (bound_matches>=2). SAVED_ONLY
+            // only needs one owner-bound layout; skipping them left loot in the drawers.
+            emit_log(STR("[AutoLootNativeProbe] LAYOUT_FALLBACK source={} layout={} bind=owner_or_lootbox level_matches={} bound_matches={}\n"),
+                     exact_name(source), exact_name(bound), unique_count, bound_count);
+            return bound;
+        }
+        if (unique_count == 1)
+        {
+            emit_log(STR("[AutoLootNativeProbe] LAYOUT_FALLBACK source={} layout={} bind=unique_level_class level_matches=1\n"),
+                     exact_name(source), exact_name(unique));
+            return unique;
+        }
+        emit_log(STR("[AutoLootNativeProbe] LAYOUT_FALLBACK_SKIP source={} reason={} level_matches={}\n"),
+                 exact_name(source), unique_count == 0 ? STR("no_level_layout") : STR("ambiguous_level_class"), unique_count);
+        return nullptr;
+    }
+
     auto resolve_target_from_source(UObject* source, UClass* pickup_base_class) -> AcquisitionTarget
     {
         AcquisitionTarget target{};
@@ -1223,6 +1296,30 @@ namespace
         }
 
         FScriptArrayHelper_InContainer containers{containers_property, shelf};
+        // F11 2026-08-04: closed office furniture reports AttachedContainers=0 with live SavedItems.
+        if (containers.Num() == 0)
+        {
+            auto* source_items_property = CastField<FArrayProperty>(source->GetPropertyByNameInChain(STR("SavedItemsInShelves")));
+            auto* source_inner = source_items_property ? CastField<FStructProperty>(source_items_property->GetInner()) : nullptr;
+            auto* source_info = source_inner && source_inner->GetStruct() ? source_inner->GetStruct().Get() : nullptr;
+            auto* source_amount_property = source_info ? CastField<FIntProperty>(source_info->GetPropertyByNameInChain(STR("Amount"))) : nullptr;
+            auto* source_asset_property = source_info ? CastField<FObjectPropertyBase>(source_info->GetPropertyByNameInChain(STR("ItemClass"))) : nullptr;
+            auto* layout = find_detached_layout_for_source(source, actor);
+            if (layout && source_items_property && source_amount_property && source_asset_property)
+            {
+                auto saved_only = resolve_saved_only_target(source,
+                                                           layout,
+                                                           actor,
+                                                           looted,
+                                                           shelves,
+                                                           source_items_property,
+                                                           source_amount_property,
+                                                           source_asset_property,
+                                                           pickup_base_class);
+                if (saved_only.source) return saved_only;
+            }
+            return target;
+        }
         for (int32 container_index = 0; container_index < containers.Num(); ++container_index)
         {
             auto* layout = read_object(container_inner, containers.GetRawPtr(container_index));

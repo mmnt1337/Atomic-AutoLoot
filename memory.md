@@ -63,7 +63,7 @@ ctest --test-dir AutoLootNativeProbe/build-shipping --output-on-failure
 ## Диагностика
 
 - Runtime markers и bounded side-effect counters выводятся из native-мода в UE4SS log.
-- Текущий build marker: `ALNP_G5_CARDFILE_SAFE_FINISH_R42_20260803_C838A8AC`. Ограниченная cardfile-телеметрия не зависит от общего log toggle и пишет `LootBoxIsUsed`, `DrawerMoveDistanceAlpha`, bound players, `start_max`, `accumulator0/1`, current/target/saved alpha sums. `TELEMETRY_WINDOW` показывает время incremental slices в `has_pending_loot_quiet`, а `SCANNER_STATE` — cursor/limit, размеры очередей и состояние weak caches.
+- Текущий build marker: `ALNP_G8_DETACHED_LAYOUT_FALLBACK_20260804_C838A8AC`. F11 OfficeHouse: Table/Wardrobe_23/Wardrobe_24 не лутались из‑за `AttachedContainers=0` (классы уже в allowlist). G8: same-level layout fallback → SAVED_ONLY. Cardfile-телеметрия по-прежнему пишет `LootBoxIsUsed`/`DrawerMoveDistanceAlpha`/alphas даже при выключенном общем log.
 - Runtime G5 подтверждён в игре: прежние лаги отсутствуют, предметы переживают save/reload, повторный запуск не дублирует выдачу.
 - Cardfile: release-branch alphas не двигают pose; в наблюдении ContinuousPickup движение связано с `PullAlpha>0`. Поведение `bShouldOpenShelvesInstantly` следует оценивать по runtime-результату, если этот путь используется в новой гипотезе.
 - Для анализа traced mappings и callback surface использовать `AUTOLOOT_TRACE_AGENT_INDEX.md`.

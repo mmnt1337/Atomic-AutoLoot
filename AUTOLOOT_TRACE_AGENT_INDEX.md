@@ -13,9 +13,9 @@
 | `BP_LootBox_Box_C` | `BP_ItemContainerLayout_Box_C` | поддерживаемый one-record container contract |
 | `BP_LootBox_Crate_C` | `BP_ItemContainerLayout_Crate_WeaponLoot_C` | class/layout mapping подтверждён; item tuple проверяется отдельно |
 | `BP_LootBox_Commode_C` | `BP_ItemContainerLayout_Commode_C` | class/layout mapping подтверждён |
-| `BP_LootBox_Table_C` | `BP_ItemContainerLayout_Table_C` | class/layout mapping подтверждён |
-| `BP_LootBox_Wardrobe_24_C` | callback сообщает `BP_ItemContainerLayout_Table_C` | учитывать фактический callback layout |
-| `BP_Lootbox_Wardrobe_23_C` | `BP_ItemContainerLayout_Wardrobe_23_C` | class/layout mapping подтверждён |
+| `BP_LootBox_Table_C` | `BP_ItemContainerLayout_Table_C` | class/layout mapping подтверждён; F11 2026-08-04 OfficeHouse: закрытый Table часто имеет `AttachedContainers=0` + live `SavedItems` |
+| `BP_LootBox_Wardrobe_24_C` | callback сообщает `BP_ItemContainerLayout_Table_C` | учитывать фактический callback layout; F11 OfficeHouse: `AttachedContainers=0` до ручного открытия |
+| `BP_Lootbox_Wardrobe_23_C` | `BP_ItemContainerLayout_Wardrobe_23_C` | class/layout mapping подтверждён; F11 OfficeHouse: `AttachedContainers=0` даже во время manual `OnContainerRemovedItem` |
 | `BP_LootBox_Cardfile_Shelf_C` | `BP_PickupableItemContainer_ShelfLoot_C` | распознан; текущая one-record validation доступна как исходная реализация |
 | `BP_VovCharacter_Invalid_C` | `LootBoxComponent` + `BP_PickupableItemContainer_VovaInvalid_C` | corpse surface; R47 seq3 one-record path |
 | `BP_VovCharacter_Invalid3_C` | `LootBoxComponent` + `BP_PickupableItemContainer_Vova_C` | corpse surface; R47 seq4 one-record path |
@@ -78,6 +78,7 @@ SetInventoryDataAndUpdateMesh(amount, ItemData)
 - `BP_DestructibleUtka_C` (2026-08-04 F11 seq1/5): после разрушения loot идёт как world pickup через ContinuousPickup → `AddItemToInventory`/`ReturnItemToPool` (Jelly + Metal Parts). Мод уже подбирает эти drops через `WORLD_PICKUP`. Отдельного LootBoxComponent/OnContainerRemovedItem нет.
 - `BP_DestructiblePchela_Blue_C` (2026-08-04 F11 seq4): тот же unknown/no-loot-component surface; в этой записи инвентарь не изменился.
 - SAVED_ONLY containers (2026-08-04 crash): при `AttachedItems=0` вызов одного `OnContainerRemovedItem` не уменьшает `SavedItemsInShelves` → `source_removal_invariants` FAIL и retry-loop. Fix: удалять строку из `SavedItemsInShelves` напрямую (как live AttachedItems surgery).
+- Detached layout (F11 2026-08-04 OfficeHouse Wardrobe_23/Table/Wardrobe_24): allowlist class уже был; автолут пропускал объекты из‑за `LootboxShelf.AttachedContainers=0` при `SavedItemsInShelves>0`. Manual loot всё равно получает same-level `BP_ItemContainerLayout_*` в `OnContainerRemovedItem`. G8: при пустом `AttachedContainers` ищем layout того же level (bind через `Owner`/`LootBox`/`OwningLootBox`/`ParentLootBox`, иначе unique class+level) и идём в SAVED_ONLY.
 - Маленькая аптечка (`BP_Pickable_consumable_aid_small_C`) наблюдалась как готовый world pickup с `AddItemToInventory`; в trace нет полного init/remove/pool цикла. Это граница имеющихся данных, которую можно расширить новым наблюдением.
 
 ## Границы имеющихся данных

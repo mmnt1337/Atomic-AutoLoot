@@ -126,6 +126,8 @@ namespace autoloot::post7c3
         // 2026-08-04 F11 loose world pickup: Magazine variant of the same ItemData.
         {"DA_Item_ShotgunAmmo", "BP_Pickupable_Shotgun_Ammo_Magazine_C"},
         {"DA_Item_AK47Ammo", "BP_Pickupable_AK47_Ammo_Magazine_C"},
+        // 2026-08-04 F11 seq2 Utka world drop — class admitted for WORLD_PICKUP via catalog_pickup_name.
+        // ItemData pair unknown; world path does not require it when class is catalogued.
         {"DA_Item_Jelly_Resource", "BP_Pickable_CapsuleJelly_C"},
         {"DA_Item_Resources_Metal_Parts", "BP_Pickupable_Metal_Parts_C"},
         {"DA_Item_Synthetic_Material_Resource", "BP_Pickable_Synthetic_Material_Resource_C"},

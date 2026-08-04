@@ -59,7 +59,7 @@ Postconditions:
 - Source, floor pickup и world pickup складываются в bounded weak-очереди ёмкостью `4096`. Inventory, pool и active source хранятся как `FWeakObjectPtr` и проверяются перед использованием.
 - Готовая работа выбирается в порядке active source → source queue → floor pickup queue → generic world-pickup queue. За EngineTick выполняется максимум одна one-record transaction.
 - После успешной container transaction тот же source остаётся active, поэтому оставшиеся записи обрабатываются по одной на следующих кадрах без нового глобального поиска.
-- Текущий layout resolution использует доказанную связь `LootboxShelf.AttachedContainers`; fallback «любой layout того же level» сейчас отсутствует.
+- Основной layout resolution — `LootboxShelf.AttachedContainers`. F11 OfficeHouse (2026-08-04): у закрытых Table/Wardrobe_23/Wardrobe_24 бывает `AttachedContainers=0` при live `SavedItems`; тогда используется detached fallback: same-level layout с bind через Owner/LootBox (или unique class+level match) → SAVED_ONLY.
 - Для pool reuse сейчас используются exact class resolution и semantic checks; общий all-Actor scan можно применять для сбора данных или экспериментальной реализации.
 - После неуспешной попытки source quarantine позволяет продолжить работу с другими источниками без повторного риска для того же объекта.
 - `Ctrl+F9` — trigger; в текущем коде callback планирует работу для EngineTick.
