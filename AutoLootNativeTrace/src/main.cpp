@@ -1,10 +1,26 @@
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <exception>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <Windows.h>
+#ifdef max
+#undef max
+#endif
+#ifdef min
+#undef min
+#endif
 
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <Helpers/String.hpp>
@@ -16,6 +32,7 @@
 #include <Unreal/Hooks/Hooks.hpp>
 #include <Unreal/UFunctionStructs.hpp>
 #include <Unreal/UObject.hpp>
+#include <Unreal/UObjectArray.hpp>
 #include <Unreal/UObjectGlobals.hpp>
 #include <Unreal/UnrealFlags.hpp>
 
@@ -24,7 +41,7 @@ namespace
     using namespace RC;
     using namespace RC::Unreal;
 
-    constexpr auto Marker = STR("ALNT_LOOT_TRIGGER_V1_20260805_C838A8AC");
+    constexpr auto Marker = STR("ALNT_LOOT_TRIGGER_V2_20260805_C838A8AC");
     constexpr int32 MaxTraceEvents = 4000;
     constexpr int32 MaxProcessEventLogs = 800;
     constexpr size_t MaxParamDumpChars = 512;
@@ -166,15 +183,41 @@ namespace
         return false;
     }
 
+    // Pure SEH helper — no C++ objects with destructors in this function.
+    auto object_slot_alive(UObject* object) -> bool
+    {
+        if (!object) return false;
+        __try
+        {
+            const int32 index = object->GetInternalIndex();
+            if (index < 0 || index >= UObjectArray::GetNumElements()) return false;
+            auto* item = UObjectArray::IndexToObject(index);
+            return item && item->IsValid(false) && item->GetUObject() == object;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
     auto describe_object(UObject* object) -> StringType
     {
         if (!object) return STR("<null>");
+        if (!object_slot_alive(object)) return STR("<stale>");
         return object->GetFullName();
+    }
+
+    auto pointer_hex(const void* value) -> StringType
+    {
+        char buf[32]{};
+        std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(value)));
+        return ensure_str(buf);
     }
 
     auto function_path_no_type(UFunction* function) -> StringType
     {
         if (!function) return STR("<null>");
+        if (!object_slot_alive(function)) return STR("<stale_fn>");
         const auto full = function->GetFullName();
         const auto space = full.find(STR(" "));
         if (space != StringType::npos && space + 1 < full.size())
@@ -184,9 +227,12 @@ namespace
         return full;
     }
 
-    auto dump_params(UFunction* function, void* parms) -> StringType
+    // Crash root cause (V1): ProcessEvent ENTER dumped UObject* params via GetFullName.
+    // Parms often hold garbage / -1; AV at dump_params GetObjectPropertyValue path.
+    // Rule: never resolve UObject names from parms. Scalars only. Skip PE dumps entirely.
+    auto dump_params_scalars(UFunction* function, void* parms) -> StringType
     {
-        if (!function || !parms) return STR("{}");
+        if (!function || !parms || !object_slot_alive(function)) return STR("{}");
         StringType out = STR("{");
         bool first = true;
         try
@@ -195,6 +241,10 @@ namespace
             {
                 if (!property) continue;
                 if (property->HasAnyPropertyFlags(CPF_ReturnParm)) continue;
+                if (property->HasAnyPropertyFlags(CPF_OutParm) && !property->HasAnyPropertyFlags(CPF_ReferenceParm))
+                {
+                    continue;
+                }
                 if (out.size() > MaxParamDumpChars)
                 {
                     out += STR(",...");
@@ -205,9 +255,15 @@ namespace
                 out += property->GetName();
                 out += STR("=");
                 void* value_ptr = property->ContainerPtrToValuePtr<void>(parms);
-                if (auto* object_property = CastField<FObjectPropertyBase>(property))
+                if (!value_ptr)
                 {
-                    out += describe_object(object_property->GetObjectPropertyValue(value_ptr));
+                    out += STR("<null>");
+                    continue;
+                }
+                if (CastField<FObjectPropertyBase>(property))
+                {
+                    // Never resolve UObject* from parms (V1 crash: garbage/-1 -> GetFullName AV).
+                    out += STR("<obj>");
                 }
                 else if (auto* bool_property = CastField<FBoolProperty>(property))
                 {
@@ -220,10 +276,6 @@ namespace
                 else if (auto* float_property = CastField<FFloatProperty>(property))
                 {
                     out += number_string(float_property->GetPropertyValue(value_ptr));
-                }
-                else if (auto* name_property = CastField<FNameProperty>(property))
-                {
-                    out += name_property->GetPropertyValue(value_ptr).ToString();
                 }
                 else
                 {
@@ -241,34 +293,41 @@ namespace
 
     auto snapshot_loot_hints(UObject* context) -> StringType
     {
-        if (!context) return STR("");
+        if (!object_slot_alive(context)) return STR("");
         StringType hints;
-        auto append_bool = [&](const TCHAR* name) {
-            if (auto* property = CastField<FBoolProperty>(context->GetPropertyByNameInChain(name)))
-            {
-                if (!hints.empty()) hints += STR(" ");
-                hints += name;
-                hints += STR("=");
-                hints += property->GetPropertyValueInContainer(context) ? STR("true") : STR("false");
-            }
-        };
-        auto append_array_num = [&](const TCHAR* name) {
-            if (auto* property = CastField<FArrayProperty>(context->GetPropertyByNameInChain(name)))
-            {
-                if (!hints.empty()) hints += STR(" ");
-                hints += name;
-                hints += STR(".Num=");
-                hints += number_string(FScriptArrayHelper_InContainer{property, context}.Num());
-            }
-        };
-        append_bool(STR("bLooted"));
-        append_bool(STR("bIsEnabled"));
-        append_bool(STR("LootBoxIsUsed"));
-        append_array_num(STR("SavedItemsInShelves"));
-        append_array_num(STR("AttachedContainers"));
-        append_array_num(STR("SavedItems"));
-        append_array_num(STR("AttachedItems"));
-        append_array_num(STR("AttachedItemContainers"));
+        try
+        {
+            auto append_bool = [&](const TCHAR* name) {
+                if (auto* property = CastField<FBoolProperty>(context->GetPropertyByNameInChain(name)))
+                {
+                    if (!hints.empty()) hints += STR(" ");
+                    hints += name;
+                    hints += STR("=");
+                    hints += property->GetPropertyValueInContainer(context) ? STR("true") : STR("false");
+                }
+            };
+            auto append_array_num = [&](const TCHAR* name) {
+                if (auto* property = CastField<FArrayProperty>(context->GetPropertyByNameInChain(name)))
+                {
+                    if (!hints.empty()) hints += STR(" ");
+                    hints += name;
+                    hints += STR(".Num=");
+                    hints += number_string(FScriptArrayHelper_InContainer{property, context}.Num());
+                }
+            };
+            append_bool(STR("bLooted"));
+            append_bool(STR("bIsEnabled"));
+            append_bool(STR("LootBoxIsUsed"));
+            append_array_num(STR("SavedItemsInShelves"));
+            append_array_num(STR("AttachedContainers"));
+            append_array_num(STR("SavedItems"));
+            append_array_num(STR("AttachedItems"));
+            append_array_num(STR("AttachedItemContainers"));
+        }
+        catch (...)
+        {
+            return STR(" hints={ERR}");
+        }
         if (hints.empty()) return STR("");
         return STR(" hints={") + hints + STR("}");
     }
@@ -296,19 +355,20 @@ namespace
         const auto phase = is_post ? STR("EXIT") : STR("ENTER");
         StringType params;
         StringType hints;
-        if (!is_post)
+        // ProcessEvent: path+context only. Param/hint walks crashed V1 on garbage UObject*.
+        if (!is_post && !process_event)
         {
-            params = dump_params(function, parms);
+            params = dump_params_scalars(function, parms);
             hints = snapshot_loot_hints(context);
         }
 
         const StringType params_part =
-            (!is_post && !params.empty() && params != STR("{}")) ? (STR(" params=") + params) : STR("");
+            (!params.empty() && params != STR("{}")) ? (STR(" params=") + params) : STR("");
 
         if (process_event)
         {
-            emit_log(STR("[AutoLootNativeTrace] PROCESS_EVENT sequence={} phase={} function={} context={}{}{}\n"),
-                     sequence, phase, path, describe_object(context), params_part, hints);
+            emit_log(STR("[AutoLootNativeTrace] PROCESS_EVENT sequence={} phase={} function={} context={}\n"),
+                     sequence, phase, path, describe_object(context));
         }
         else
         {
@@ -329,12 +389,19 @@ namespace
     auto should_log_process_event(UFunction* function, UObject* context) -> bool
     {
         if (!g_pe_hunt.load(std::memory_order_relaxed)) return false;
-        if (!function) return false;
+        if (!function || !object_slot_alive(function)) return false;
 
         const auto path = function_path_no_type(function);
         const auto path_lower = to_lower_ascii(narrow(path));
         if (!g_verbose.load(std::memory_order_relaxed) && is_noise_path(path_lower)) return false;
 
+        // Prefer path needles; only touch context name if path alone is not enough.
+        if (is_interest_path(path_lower, {}))
+        {
+            const int32 pe = g_pe_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+            return pe <= MaxProcessEventLogs;
+        }
+        if (!object_slot_alive(context)) return false;
         const auto context_lower = to_lower_ascii(narrow(describe_object(context)));
         if (!is_interest_path(path_lower, context_lower)) return false;
 
@@ -344,9 +411,10 @@ namespace
 
     auto on_process_event(bool is_post, UObject* context, UFunction* function, void* parms) -> void
     {
+        (void)parms;
         if (!g_trace_active.load(std::memory_order_acquire)) return;
         if (!should_log_process_event(function, context)) return;
-        log_call(true, is_post, function_path_no_type(function), context, function, parms);
+        log_call(true, is_post, function_path_no_type(function), context, function, nullptr);
     }
 
     auto disarm_trace(const TCHAR* reason) -> void
